@@ -1,0 +1,9 @@
+README.md
+setup.py
+src/telescope/__init__.py
+src/telescope/server.py
+src/telescope.egg-info/PKG-INFO
+src/telescope.egg-info/SOURCES.txt
+src/telescope.egg-info/dependency_links.txt
+src/telescope.egg-info/requires.txt
+src/telescope.egg-info/top_level.txt

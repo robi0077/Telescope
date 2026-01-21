@@ -1,7 +1,10 @@
-av==11.0.0
-numpy>=1.24.0
+av==12.3.0
+numpy<2.0.0
 scipy>=1.10.0
 xxhash>=3.2.0
 redis>=5.0.0
 pytest>=7.0.0
 click>=8.0.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+python-multipart>=0.0.5

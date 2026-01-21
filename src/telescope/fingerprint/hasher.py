@@ -1,7 +1,7 @@
 
 import numpy as np
 from scipy.fftpack import dct
-import cv2  # Just kidding, strict dependencies: numpy/scipy only.
+# import cv2  # Just kidding, strict dependencies: numpy/scipy only.
 # Re-implementing basic image ops in numpy to avoid opencv dependency for "systems-first" lightness?
 # Actually, for "Internet Scale", usually OpenCV is standard, but the user plan didn't explicitly forbid it.
 # However, requirements.txt strictly said numpy/scipy/av. I will stick to that.
