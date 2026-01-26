@@ -1,6 +1,5 @@
-
 import os
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Security
@@ -9,6 +8,7 @@ class Settings(BaseSettings):
     # Infrastructure
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "temp_uploads")
+    USE_CELERY: bool = os.getenv("USE_CELERY", "True").lower() == "true"
     
     # Telescope Logic
     # In prod, we might want to tune these

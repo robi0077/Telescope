@@ -3,7 +3,7 @@ import os
 import logging
 from celery import Celery
 from .config import settings
-from .server import SystemState 
+from .core import state # Singleton state 
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +18,7 @@ celery_app = Celery(
 
 # Initialize System State (The "Brain")
 # In a real worker, this loads the heavy models into RAM once at startup.
-state = SystemState()
+# state is already imported from .core (Singleton)
 
 @celery_app.task(bind=True, name="process_video_task")
 def process_video_task(self, file_path: str, video_id: str):

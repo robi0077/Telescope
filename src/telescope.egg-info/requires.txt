@@ -1,6 +1,0 @@
-av
-numpy
-scipy
-xxhash
-redis
-click

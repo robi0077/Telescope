@@ -2,99 +2,140 @@
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Optional
 import logging
+import redis
+import json
+
+from telescope.config import settings
 
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_POSTING_LIST_SIZE = 10000 # Zipf protection threshold
+MAX_POSTING_LIST_SIZE = 10000 
 SEGMENT_BITS = 16
 HASH_BITS = 64
 NUM_SEGMENTS = HASH_BITS // SEGMENT_BITS
 
-class PostingList:
-    def __init__(self):
-        self.entries: List[Tuple[str, float]] = [] # (video_id, timestamp)
-        self.is_stop_listed: bool = False
-
-    def add(self, video_id: str, timestamp: float):
-        if self.is_stop_listed:
-            return
-        
-        self.entries.append((video_id, timestamp))
-        
-        if len(self.entries) > MAX_POSTING_LIST_SIZE:
-            self.is_stop_listed = True
-            self.entries = [] # Flush to free memory, permanently ignored
-            logger.warning(f"PostingList hit limits. Marked as Stop-Listed.")
-
 class Tier1Index:
     """
-    Implements MIH with 4 x 16-bit segments.
-    Enforces 'Zipf’s Law Protection'.
+    Implements MIH with Redis Backend.
     """
     
     def __init__(self):
-        # 4 Tables (one per segment)
-        # Table -> {segment_value: PostingList}
-        self.tables: List[Dict[str, PostingList]] = [defaultdict(PostingList) for _ in range(NUM_SEGMENTS)]
+        # Redis Connection
+        try:
+            self.r = redis.from_url(settings.REDIS_URL, decode_responses=True)
+            self.r.ping() # Check connection
+            self.use_redis = True
+            logger.info("Connected to Redis for Tier 1 Index.")
+        except Exception as e:
+            logger.warning(f"Redis not available ({e}). Using IN-MEMORY (RAM) Index (Not persistent).")
+            self.use_redis = False
+            # Fallback RAM tables: [ { segment_val: [entries] } ]
+            self.tables = [defaultdict(list) for _ in range(NUM_SEGMENTS)]
         
     def _split_hash(self, hash_hex: str) -> List[str]:
-        # Hash is 64-bit hex (16 chars)
-        # Split into 4 chunks of 4 chars
-        if len(hash_hex) != 16:
-            # Handle non-compliant hashes or fallback
-            return []
-        
+        if len(hash_hex) != 16: return []
         return [hash_hex[i:i+4] for i in range(0, 16, 4)]
+        
+    def _get_key(self, segment_idx: int, segment_val: str) -> str:
+        return f"v4:t1:{segment_idx}:{segment_val}"
 
     def index(self, hash_hex: str, video_id: str, timestamp: float):
         segments = self._split_hash(hash_hex)
-        for i, val in enumerate(segments):
-            self.tables[i][val].add(video_id, timestamp)
+        payload = f"{video_id}|{timestamp}" 
+        
+        if self.use_redis:
+            # Atomic Lua Script: Only RPUSH if LLEN < Limit
+            # ARGV[1] = limit, ARGV[2] = payload
+            # KEYS[1] = key
+            lua_script = """
+            if redis.call('LLEN', KEYS[1]) < tonumber(ARGV[1]) then
+                return redis.call('RPUSH', KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+            """
+            
+            pipe = self.r.pipeline()
+            for i, val in enumerate(segments):
+                key = self._get_key(i, val)
+                # Register the script (or eval directly for simplicity in Python redis lib)
+                # The lib handles caching if using register_script, but eval is fine for low volume
+                pipe.eval(lua_script, 1, key, MAX_POSTING_LIST_SIZE, payload)
+                
+            pipe.execute()
+        else:
+            for i, val in enumerate(segments):
+                target_list = self.tables[i][val]
+                if len(target_list) < MAX_POSTING_LIST_SIZE:
+                     target_list.append(payload)
 
     def query(self, hash_hex: str) -> Dict[str, int]:
-        """
-        Returns candidates and their match counts.
-        candidates: {video_id: number_of_segment_matches}
-        
-        Enforces 'k-of-n Admission Gate' logic partially here 
-        (count returned, filtering usually happens at aggregator).
-        """
         segments = self._split_hash(hash_hex)
         candidates = defaultdict(int)
         
-        for i, val in enumerate(segments):
-            plist = self.tables[i].get(val)
-            if plist and not plist.is_stop_listed:
-                for vid, _ in plist.entries:
-                    candidates[vid] += 1
-        
+        if self.use_redis:
+            pipe = self.r.pipeline()
+            keys_to_fetch = []
+            
+            # 1. Stop-Listing / Dynamic Pruning
+            # Check lengths first to avoid fetching massive lists (Viral segments)
+            # We construct a pipeline to get LLENs first
+            len_pipe = self.r.pipeline()
+            for i, val in enumerate(segments):
+                key = self._get_key(i, val)
+                len_pipe.llen(key)
+            
+            sizes = len_pipe.execute()
+            
+            # 2. Selective Fetch
+            # Only fetch segments with manageable size (e.g., < 2000 items)
+            # Extremely common segments provide low entropy (bad signal) anyway.
+            DYNAMIC_PRUNING_LIMIT = 2000 
+            
+            fetch_indices = []
+            for idx, size in enumerate(sizes):
+                if size > 0 and size < DYNAMIC_PRUNING_LIMIT:
+                    i = idx 
+                    val = segments[i]
+                    key = self._get_key(i, val)
+                    pipe.lrange(key, 0, -1)
+                    fetch_indices.append(idx)
+            
+            if not fetch_indices:
+                return candidates
+
+            results = pipe.execute()
+            
+            # Process results (results is list of lists)
+            for raw_entries in results:
+                for entry in raw_entries:
+                    try:
+                        vid, _ = entry.split('|')
+                        candidates[vid] += 1
+                    except ValueError:
+                        continue
+        else:
+            # RAM Fallback
+            for i, val in enumerate(segments):
+                raw_entries = self.tables[i].get(val, [])
+                for entry in raw_entries:
+                    try:
+                        vid, _ = entry.split('|')
+                        candidates[vid] += 1
+                    except ValueError:
+                        continue
+                    
         return candidates
 
 class CandidateAggregator:
-    """
-    Applies the k-of-n gate policy.
-    Gate: >= 2 segments match.
-    """
-    
     def filter_candidates(self, candidates: Dict[str, int]) -> List[str]:
-        # Basic k=2 rule on a SINGLE signal (structural usually)
         return [vid for vid, count in candidates.items() if count >= 2]
     
     def cross_signal_gate(self, struct_candidates: Dict[str, int], edge_candidates: Dict[str, int]) -> List[str]:
-        # OR >= 1 segment match across >= 2 different signals
-        # This requires slightly more complex logic tracking per-signal hits.
-        # For v4.3 MVP, we implement the basic logic.
         final_set = set()
-        
-        # Rule 1: >=2 in Structural
         for vid, count in struct_candidates.items():
-            if count >= 2:
-                final_set.add(vid)
-                
-        # Rule 2: >=1 in Struct AND >=1 in Edge
+            if count >= 2: final_set.add(vid)
         for vid in struct_candidates:
-            if vid in edge_candidates:
-                final_set.add(vid)
-                
+            if vid in edge_candidates: final_set.add(vid)
         return list(final_set)

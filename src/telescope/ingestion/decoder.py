@@ -35,16 +35,24 @@ class GOPAlignedDecoder:
                 container.seek(pts, stream=stream, any_frame=False, backward=True)
                 
                 # Decode the next frame (which should be the I-frame)
-                for frame in container.decode(stream):
-                    # Validate if this is the I-frame we want (or close enough)
-                    # Note: av.seek might not be perfectly precise in all containers, 
-                    # but limiting to I-frames makes it deterministic.
-                    
-                    if frame.key_frame:
-                        # Convert to efficient numpy array (RGB)
-                        img_array = frame.to_ndarray(format='rgb24')
-                        yield (float(frame.pts * stream.time_base), img_array)
-                        break # Only want the single I-frame, stop decoding this GOP
-                    else:
-                        # Should not happen if seek(any_frame=False) works as expected for I-frames
-                        continue
+                try:
+                    for frame in container.decode(stream):
+                        # Validate if this is the I-frame we want (or close enough)
+                        
+                        if frame.key_frame:
+                            # DRIFT CORRECTION
+                            current_ts = float(frame.pts * stream.time_base)
+                            if abs(current_ts - target_ts) > 0.5:
+                                logger.warning(f"Seek Drift Detected: Target {target_ts:.2f} vs Actual {current_ts:.2f}. Skipping.")
+                                break 
+
+                            # Convert to efficient numpy array (RGB)
+                            img_array = frame.to_ndarray(format='rgb24')
+                            yield (current_ts, img_array)
+                            break # Only want the single I-frame, stop decoding this GOP
+                        else:
+                            # Should not happen if seek(any_frame=False) works as expected for I-frames
+                            continue
+                except Exception as e:
+                    logger.error(f"Frame Decode Failed at {target_ts}: {e}")
+                    continue

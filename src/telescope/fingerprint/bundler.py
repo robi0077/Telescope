@@ -36,11 +36,14 @@ class Bundler:
         if s_orig < s_mirror:
             canonical_s = s_orig
             canonical_e = e_orig
+            # optimization: only compute color for the winner
+            canonical_c = Hasher.color_hash(image)
         else:
             canonical_s = s_mirror
             # Note: Edge hash needs to be recomputed for proper mirroring if we want total invariance,
             # or we just store the one corresponding to the structural min.
             canonical_e = Hasher.edge_hash(image_mirror)
+            canonical_c = Hasher.color_hash(image_mirror)
             
         return FingerprintBundle(
             video_id=video_id,
@@ -48,6 +51,6 @@ class Bundler:
             variants={
                 'structural': canonical_s,
                 'edge': canonical_e,
-                'color': Hasher.color_hash(image)
+                'color': canonical_c
             }
         )
