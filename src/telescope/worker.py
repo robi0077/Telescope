@@ -55,6 +55,10 @@ def process_video_task(self, file_path: str, video_id: str):
             state.index_edge.index(bundle.variants['edge'], video_id, ts)
             processed_count += 1
             
+        # Persistence: Save to Redis Inventory
+        if state.index_struct.use_redis:
+            state.index_struct.r.sadd("v4:inventory", video_id)
+            
         logger.info(f"[Task {self.request.id}] Finished. Processed {processed_count} frames.")
         return {"status": "completed", "frames": processed_count, "video_id": video_id}
 

@@ -70,17 +70,15 @@ class Tier1Index:
                 if len(target_list) < MAX_POSTING_LIST_SIZE:
                      target_list.append(payload)
 
-    def query(self, hash_hex: str) -> Dict[str, int]:
+    def query(self, hash_hex: str) -> Dict[str, List[float]]:
         segments = self._split_hash(hash_hex)
-        candidates = defaultdict(int)
+        candidates = defaultdict(list)
         
         if self.use_redis:
             pipe = self.r.pipeline()
             keys_to_fetch = []
             
             # 1. Stop-Listing / Dynamic Pruning
-            # Check lengths first to avoid fetching massive lists (Viral segments)
-            # We construct a pipeline to get LLENs first
             len_pipe = self.r.pipeline()
             for i, val in enumerate(segments):
                 key = self._get_key(i, val)
@@ -88,9 +86,6 @@ class Tier1Index:
             
             sizes = len_pipe.execute()
             
-            # 2. Selective Fetch
-            # Only fetch segments with manageable size (e.g., < 2000 items)
-            # Extremely common segments provide low entropy (bad signal) anyway.
             DYNAMIC_PRUNING_LIMIT = 2000 
             
             fetch_indices = []
@@ -111,8 +106,8 @@ class Tier1Index:
             for raw_entries in results:
                 for entry in raw_entries:
                     try:
-                        vid, _ = entry.split('|')
-                        candidates[vid] += 1
+                        vid, ts_str = entry.split('|')
+                        candidates[vid].append(float(ts_str))
                     except ValueError:
                         continue
         else:
@@ -121,8 +116,8 @@ class Tier1Index:
                 raw_entries = self.tables[i].get(val, [])
                 for entry in raw_entries:
                     try:
-                        vid, _ = entry.split('|')
-                        candidates[vid] += 1
+                        vid, ts_str = entry.split('|')
+                        candidates[vid].append(float(ts_str))
                     except ValueError:
                         continue
                     
