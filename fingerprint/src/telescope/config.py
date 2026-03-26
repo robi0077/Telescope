@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     
     # Infrastructure
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6666/0")
-    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", r"..\scrapper\temp")
+    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", r"C:\projects\scrapper\temp")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", r"..\prints")
     USE_CELERY: bool = os.getenv("USE_CELERY", "False").lower() == "true"
     

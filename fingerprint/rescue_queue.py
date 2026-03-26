@@ -3,7 +3,7 @@ import json
 import redis
 
 def rescue_temp_folders():
-    temp_dir = r"c:\projects\main_project\scrapper\temp"
+    temp_dir = r"C:\projects\scrapper\temp"
     redis_client = redis.Redis.from_url("redis://localhost:6666/0", decode_responses=True)
     queue = "queue:to_fingerprint"
     
