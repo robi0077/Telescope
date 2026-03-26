@@ -1,147 +1,125 @@
+"""
+PDQ Perceptual Hash (256-bit)
+===========================================
+Drop-in replacement for the legacy pHash/dHash/color-hash triplet.
+
+Algorithm (faithful to Meta's reference implementation):
+  1. BT.601 luma conversion (float32)
+  2. Jarosz separable box filter  ← the key differentiator vs plain pHash
+     Window = max((dim // 64) * 4, 1) — same formula as Meta's C++ source.
+     Implemented as two scipy.ndimage.uniform_filter1d passes (O(N), SIMD-friendly).
+  3. 64×64 block-average downsample (anti-aliased by step 2)
+  4. 2D DCT-II, ortho norm
+  5. Top-left 16×16 block  →  256 coefficients
+  6. Threshold at *mean* (PDQ uses mean, not median like pHash)
+  7. Pack 256 booleans → 32 bytes → 64-char hex string
+
+Returns both the hex string and the raw bool array.
+The bool array is consumed by the TMK accumulator in core.py.
+"""
+
+from __future__ import annotations
 
 import numpy as np
-from scipy.fftpack import dct
-# import cv2  # Just kidding, strict dependencies: numpy/scipy only.
-# Re-implementing basic image ops in numpy to avoid opencv dependency for "systems-first" lightness?
-# Actually, for "Internet Scale", usually OpenCV is standard, but the user plan didn't explicitly forbid it.
-# However, requirements.txt strictly said numpy/scipy/av. I will stick to that.
-# Valid validation: numpy-based resize/color conversion.
+from scipy.fftpack import dct as scipy_dct
+from scipy.ndimage import uniform_filter1d
 
-def resize_image(image: np.ndarray, size=(32, 32)) -> np.ndarray:
+# ── Constants ──────────────────────────────────────────────────────────────────
+_LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)   # BT.601
+_PDQ_DIM   = 64    # intermediate resolution after Jarosz + downsample
+_PDQ_KEEP  = 16    # DCT coefficients kept per axis  →  16×16 = 256 bits
+PDQ_BITS   = _PDQ_KEEP * _PDQ_KEEP  # 256 — exported for use in TMKAccumulator
+
+
+# ── Internal helpers ───────────────────────────────────────────────────────────
+
+def _to_luma(image: np.ndarray) -> np.ndarray:
+    """RGB HxWx3 → float32 HxW luma via BT.601 coefficients."""
+    return image[..., :3].astype(np.float32) @ _LUMA
+
+
+def _jarosz(luma: np.ndarray) -> np.ndarray:
     """
-    Robust Resize using Block Averaging (Anti-Aliasing).
-    Instead of slicing [::k], we calculate the mean of each k*k block.
+    Separable Jarosz box filter.
+
+    Window size follows Meta's formula: max((dim // 64) * 4, 1).
+    Two uniform_filter1d passes (horizontal then vertical) = O(N),
+    identical in output to a full 2D box convolution, no extra memory.
+    Mode='nearest' replicates edge pixels (same as Meta's clamp strategy).
     """
-    h, w = image.shape[:2]
-    h_new, w_new = size
-    
-    # Calculate block sizes
-    h_block = h // h_new
-    w_block = w // w_new
-    
-    # Handle strictly smaller images (upscaling scenario - rare in this pipeline but possible)
-    if h_block == 0 or w_block == 0:
-         # Fallback to naive expansion or just error. 
-         # For this pipeline, videos are 1080p+, target is 32x32. Safe to assume block >= 1.
-         return image[:h_new, :w_new] 
+    h, w = luma.shape
+    fw = max((w // _PDQ_DIM) * 4, 1)
+    fh = max((h // _PDQ_DIM) * 4, 1)
+    tmp = uniform_filter1d(luma, size=fw, axis=1, mode='nearest')
+    return uniform_filter1d(tmp,  size=fh, axis=0, mode='nearest')
 
-    # Crop to exact multiple of block size
-    h_crop = h_block * h_new
-    w_crop = w_block * w_new
-    
-    cropped = image[:h_crop, :w_crop]
-    
-    # Reshape: (rows, block_h, cols, block_w, channels)
-    # Then take mean over the blocks (axis 1 and 3)
-    if len(image.shape) == 3:
-        reshaped = cropped.reshape(h_new, h_block, w_new, w_block, image.shape[2])
-        return reshaped.mean(axis=(1, 3)).astype(np.uint8)
-    else:
-        # Grayscale case
-        reshaped = cropped.reshape(h_new, h_block, w_new, w_block)
-        return reshaped.mean(axis=(1, 3)).astype(np.uint8)
 
-def rgb_to_gray(image: np.ndarray) -> np.ndarray:
-    return np.dot(image[...,:3], [0.2989, 0.5870, 0.1140])
+def _downsample_64(filtered: np.ndarray) -> np.ndarray:
+    """
+    Block-average downsample to 64×64.
+    The Jarosz filter already removed all aliasing above 1/(fw) cycles/pixel,
+    so simple block averaging here is lossless within the passband.
+    """
+    h, w = filtered.shape
+    bh = h // _PDQ_DIM
+    bw = w // _PDQ_DIM
 
-class Hasher:
-    
-    @staticmethod
-    def structural_hash(image: np.ndarray) -> str:
-        """
-        Implementation of pHash (Perceptual Hash).
-        1. Resize to 32x32
-        2. Grayscale
-        3. DCT
-        4. Keep top-left 8x8 (low frequencies)
-        5. Binarize based on median
-        """
-        # 1. Resize & 2. Gray
-        # Use robustness-enhanced resizer
-        small = resize_image(image, size=(32, 32))
-        
-        # Ensure dimensions in case resizer failed (shouldn't happen with new logic but safe guard)
-        if small.shape[0] != 32 or small.shape[1] != 32:
-             # Just crop if blocks failed
-             small = small[:32, :32]
-        
-        gray = rgb_to_gray(small)
-        
-        # 3. DCT
-        vals = dct(dct(gray, axis=0), axis=1)
-        
-        # 4. Keep 8x8 (excluding DC term at 0,0 usually, but let's keep it simple)
-        dct_low_freq = vals[0:8, 0:8]
-        
-        # 5. Median
-        med = np.median(dct_low_freq)
-        
-        # 6. Hash
-        hash_bool = dct_low_freq > med
-        
-        # Convert to hex string
-        return Hasher._bool_to_hex(hash_bool.flatten())
+    if bh == 0 or bw == 0:
+        # Images smaller than 64px — crop/pad (shouldn't happen in this pipeline)
+        out = np.zeros((_PDQ_DIM, _PDQ_DIM), dtype=np.float32)
+        r = min(h, _PDQ_DIM)
+        c = min(w, _PDQ_DIM)
+        out[:r, :c] = filtered[:r, :c]
+        return out
 
-    @staticmethod
-    def edge_hash(image: np.ndarray) -> str:
-        """
-        dHash (Difference Hash).
-        Resize to 9x8, compute row differences.
-        """
-        h, w, _ = image.shape
-        # Resize to 9x8
-        # Naive slice
-        small = image[::h//8, ::w//9]
-        if small.shape[0] > 8: small = small[:8, :]
-        if small.shape[1] > 9: small = small[:, :9]
-        
-        gray = rgb_to_gray(small)
-        
-        # Difference: P[x] > P[x+1]
-        diff = gray[:, 1:] > gray[:, :-1]
-        
-        return Hasher._bool_to_hex(diff.flatten())
+    cropped = filtered[:bh * _PDQ_DIM, :bw * _PDQ_DIM]
+    return cropped.reshape(_PDQ_DIM, bh, _PDQ_DIM, bw).mean(axis=(1, 3))
 
-    @staticmethod
-    def color_hash(image: np.ndarray) -> str:
-        """
-        2x2x2 HSV grid or similar low-res signature.
-        For simplicity: 4-region average color in HSV (or RGB).
-        Let's do 4x4 grid of average RGB, quantized.
-        """
-        h, w, _ = image.shape
-        # Split into 4x4 grid
-        output = []
-        step_h = h // 4
-        step_w = w // 4
-        
-        for r in range(4):
-            for c in range(4):
-                chunk = image[r*step_h:(r+1)*step_h, c*step_w:(c+1)*step_w]
-                avg = np.mean(chunk, axis=(0,1))
-                # Quantize to 2 bits per channel -> 64 values total
-                q = (avg / 64).astype(int) 
-                output.append(f"{q[0]}{q[1]}{q[2]}")
-        
-        return "".join(output)
 
-    @staticmethod
-    def _bool_to_hex(bool_arr: np.ndarray) -> str:
-        """
-        Vectorized Bit Packing (50x speedup).
-        Packs bool array into uint8 bytes, then hex.
-        """
-        # np.packbits packs bits into bytes (8 bits per byte)
-        packed = np.packbits(bool_arr.astype(int))
-        return packed.tobytes().hex()
+# ── Public API ─────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def hamming_distance(hash1: str, hash2: str) -> int:
-        """
-        Bitwise Comparator (0-64).
-        """
-        # Python 3.10+ has int.bit_count() which is O(1) for this size
-        h1 = int(hash1, 16)
-        h2 = int(hash2, 16)
-        return (h1 ^ h2).bit_count()
+def pdq_hash(image: np.ndarray) -> tuple[str, np.ndarray]:
+    """
+    Compute the 256-bit PDQ perceptual hash for a single frame.
 
+    Parameters
+    ----------
+    image : np.ndarray
+        RGB frame, shape (H, W, 3), dtype uint8.
+
+    Returns
+    -------
+    hex_str : str
+        64-character lowercase hex string (256 bits).
+    bits : np.ndarray
+        Shape (256,) boolean array — consumed by TMKAccumulator.
+        True where DCT coefficient > mean, False otherwise.
+    """
+    luma     = _to_luma(image)
+    filtered = _jarosz(luma)
+    small    = _downsample_64(filtered)            # float32 64×64
+
+    # 2D DCT-II (separable: row-wise then col-wise, both ortho-normalised)
+    dct2d = scipy_dct(scipy_dct(small, axis=0, norm='ortho'), axis=1, norm='ortho')
+
+    # Top-left 16×16 block captures the macro visual structure
+    block  = dct2d[:_PDQ_KEEP, :_PDQ_KEEP]        # (16, 16)
+    mean   = float(block.mean())
+    bits   = (block > mean).flatten()              # (256,) bool
+
+    packed  = np.packbits(bits.astype(np.uint8))
+    hex_str = packed.tobytes().hex()               # 64 hex chars
+    return hex_str, bits
+
+
+def hamming_distance(hash_a: str, hash_b: str) -> int:
+    """
+    Bitwise Hamming distance between two PDQ hex strings.
+    Operates on 256-bit integers — still O(1) via int.bit_count() on Python 3.10+.
+    Valid range: 0 (identical) – 256 (inverse).
+    """
+    if len(hash_a) != len(hash_b):
+        raise ValueError(f"Hash length mismatch: {len(hash_a)} vs {len(hash_b)}")
+    a = int(hash_a, 16)
+    b = int(hash_b, 16)
+    return (a ^ b).bit_count()
