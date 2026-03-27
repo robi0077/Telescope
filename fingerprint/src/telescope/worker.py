@@ -8,7 +8,7 @@ Output layout (per video_id):
   {OUTPUT_DIR}/{video_id}/
     metadata.json               ← duration, resolution, fps, codec
     video_hash/
-      frames.json               ← [{video_id, timestamp, pdq_hash}, ...]
+      pdq_frames.json           ← [{video_id, timestamp, pdq_hash}, ...]
       tmk_vector.json           ← {video_id, num_frames, periods, vector}
     audio_hash/
       fingerprints.json         ← [{video_id, timestamp, acoustic_hash}, ...]
@@ -78,10 +78,10 @@ def process_video_task(self, file_path: str, video_id: str):
             }
         )
 
-        # ── video_hash/frames.json  (per-frame PDQ hashes) ───────────────────
+        # ── video_hash/pdq_frames.json  (per-frame PDQ hashes) ───────────────
         if per_frame_hashes:
             _write_json(
-                os.path.join(video_hash_dir, "frames.json"),
+                os.path.join(video_hash_dir, "pdq_frames.json"),
                 per_frame_hashes
             )
 
