@@ -51,7 +51,9 @@ async def fingerprint_video(file: UploadFile = File(...), api_key: str = Depends
     Accepts a video file, saves it to the temp directory, and dispatches a Celery worker 
     to generate the fingerprints to a JSON file.
     """
-    file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
+    # FIX: Critical Path Traversal Vulnerability (Arbitrary File Overwrite)
+    safe_filename = os.path.basename(file.filename)
+    file_path = os.path.join(settings.UPLOAD_DIR, safe_filename)
     try:
         with open(file_path, "wb") as buffer:
             while chunk := await file.read(1024 * 1024):  # 1MB chunks to prevent OOM
@@ -63,8 +65,8 @@ async def fingerprint_video(file: UploadFile = File(...), api_key: str = Depends
     
     try:
         # Always Dispatch - Redis is guaranteed by startup check
-        task = process_video_task.delay(file_path, file.filename)
-        return {"status": "queued", "job_id": str(task.id), "video_id": file.filename, "message": "Accepted for background fingerprinting."}
+        task = process_video_task.delay(file_path, safe_filename)
+        return {"status": "queued", "job_id": str(task.id), "video_id": safe_filename, "message": "Accepted for background fingerprinting."}
     except Exception as e:
         logger.error(f"Celery Dispatch Failed: {e}")
         raise HTTPException(500, "Background Worker Queue Failed")
