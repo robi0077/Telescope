@@ -46,15 +46,18 @@ def get_status(api_key: str = Depends(get_api_key)):
     }
 
 @app.post("/fingerprint", response_model=IngestResponse)
-def fingerprint_video(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
+async def fingerprint_video(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
     """
     Accepts a video file, saves it to the temp directory, and dispatches a Celery worker 
     to generate the fingerprints to a JSON file.
     """
     file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
     try:
-        with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    except Exception as e: raise HTTPException(500, f"Upload failed: {e}")
+        with open(file_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks to prevent OOM
+                buffer.write(chunk)
+    except Exception as e: 
+        raise HTTPException(500, f"Upload failed: {e}")
 
     logger.info(f"Received {file.filename}. Dispatching for fingerprint extraction...")
     
