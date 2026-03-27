@@ -34,7 +34,7 @@ class BitstreamParser:
             with av.open(file_path) as container:
                 stream = container.streams.video[0]
                 
-                # Basic metadata
+                # Basic metadata (O(1) header read without pixel demuxing)
                 metadata = VideoMetadata(
                     duration=float(stream.duration * stream.time_base) if stream.duration else 0.0,
                     width=stream.width,
@@ -44,34 +44,7 @@ class BitstreamParser:
                     extradata=stream.codec_context.extradata or b''
                 )
                 
-                # GOP Scan (Packet level only)
-                # We iterate packets, identifying Keyframes (I-frames)
-                # Use array.array for memory efficiency on long 4h+ streams
-                i_frame_timestamps = array.array('d')
-                
-                start_time = time.time()
-                TIMEOUT_SECONDS = 60 # Prevent infinite loops on corrupt files
-                
-                for packet in container.demux(stream):
-                    if time.time() - start_time > TIMEOUT_SECONDS:
-                        logger.warning(f"Parser timed out scanning {file_path}. Returned partial GOP.")
-                        break
-
-                    if packet.is_keyframe:
-                        # packet.pts is Presentation Time Stamp
-                        if packet.pts is not None:
-                            timestamp = float(packet.pts * stream.time_base)
-                            i_frame_timestamps.append(timestamp)
-                            
-                # Deduplicate and sort (though usually sequential)
-                # array -> set -> list -> sorted -> array is clunky, but necessary for unique
-                # Actually, packet stream is sequential. Just dedup adjacent? 
-                # For safety/simplicity:
-                unique_ts = sorted(list(set(i_frame_timestamps)))
-                metadata.gop_structure = array.array('d', unique_ts)
-                
-                logger.info(f"Parsed {file_path}: {len(metadata.gop_structure)} I-frames found.")
-                
+                logger.info(f"Parsed metadata headers for {file_path}")
                 return metadata
                 
         except Exception as e:

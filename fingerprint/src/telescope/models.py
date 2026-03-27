@@ -15,5 +15,6 @@ class IngestResponse(BaseModel):
 
 class FingerprintResponse(BaseModel):
     video_id: str
-    frames_extracted: int
-    fingerprints: List[Dict[str, Any]]
+    pdq_frames: int
+    audio_frames: int
+    tmk_dim: int

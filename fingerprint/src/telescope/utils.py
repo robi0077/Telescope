@@ -33,6 +33,10 @@ def check_redis_availability(retries: int = 15, delay: int = 2) -> bool:
     Checks if Redis is available for Async Worker with retries.
     Returns True if connected, False (and logs warning) if not.
     """
+    if not settings.USE_CELERY:
+        logger.info("USE_CELERY is False. Skipping Redis check for local mode.")
+        return True
+
     url = settings.REDIS_URL
     logger.info(f"Checking Redis availability at {url} (up to {retries * delay}s)...")
     
