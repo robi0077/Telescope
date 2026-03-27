@@ -24,6 +24,7 @@ Comparison in telescope_db is then a single dot-product (cosine similarity).
 from __future__ import annotations
 
 import logging
+import concurrent.futures
 from typing import Dict, List, Tuple, Any
 
 import numpy as np
@@ -136,6 +137,29 @@ class FingerprintGenerator:
         self.bundler         = Bundler()
         self.audio_extractor = AcousticExtractor()
 
+    def _run_video_pipeline(self, file_path: str, video_id: str, metadata: VideoMetadata) -> Tuple[List[Dict[str, Any]], List[float]]:
+        per_frame_hashes: List[Dict[str, Any]] = []
+        tmk = TMKAccumulator()
+        for ts, img in self.decoder.decode_bundlable_frames(file_path, metadata):
+            bundle = self.bundler.create_bundle(video_id, ts, img)
+            tmk.add_frame(ts, bundle.pdq_bits)
+            per_frame_hashes.append({
+                "video_id" : video_id,
+                "timestamp": ts,
+                "pdq_hash" : bundle.pdq_hash,
+            })
+        return per_frame_hashes, tmk.compute_vector()
+
+    def _run_audio_pipeline(self, file_path: str, video_id: str) -> List[Dict[str, Any]]:
+        audio_hashes: List[Dict[str, Any]] = []
+        for ts, hash_val in self.audio_extractor.extract_audio_hashes(file_path):
+            audio_hashes.append({
+                "video_id"    : video_id,
+                "timestamp"   : ts,
+                "acoustic_hash": hash_val,
+            })
+        return audio_hashes
+
     def extract_fingerprints(
         self,
         file_path : str,
@@ -143,42 +167,19 @@ class FingerprintGenerator:
     ) -> Tuple[VideoMetadata, List[Dict[str, Any]], List[Dict[str, Any]], List[float]]:
         """
         Full generation pipeline.
-
-        Returns
-        -------
-        (metadata, per_frame_hashes, audio_hashes, tmk_vector)
+        Runs Audio and Video extraction concurrently to achieve Single-Pass Disk I/O 
+        via the OS page cache.
         """
-        per_frame_hashes: List[Dict[str, Any]] = []
-        audio_hashes:     List[Dict[str, Any]] = []
-        tmk              = TMKAccumulator()
-
-        # 1. Parse bitstream → GOP structure (no pixel decode)
+        # 1. Parse bitstream (O(1) header read)
         metadata = self.parser.parse(file_path)
 
-        # 2. Decode I-frames → PDQ hash → TMK accumulate
-        for ts, img in self.decoder.decode_bundlable_frames(file_path, metadata):
-            bundle = self.bundler.create_bundle(video_id, ts, img)
-
-            # Feed TMK accumulator first (online, O(1))
-            tmk.add_frame(ts, bundle.pdq_bits)
-
-            # Per-frame record for frame-level lookup in telescope_db
-            per_frame_hashes.append({
-                "video_id" : video_id,
-                "timestamp": ts,
-                "pdq_hash" : bundle.pdq_hash,
-            })
-
-        # 3. Audio hashes (unchanged path)
-        for ts, hash_val in self.audio_extractor.extract_audio_hashes(file_path):
-            audio_hashes.append({
-                "video_id"    : video_id,
-                "timestamp"   : ts,
-                "acoustic_hash": hash_val,
-            })
-
-        # 4. Materialise TMK vector after all frames are processed
-        tmk_vector = tmk.compute_vector()
+        # 2. Run video and audio in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_video = executor.submit(self._run_video_pipeline, file_path, video_id, metadata)
+            future_audio = executor.submit(self._run_audio_pipeline, file_path, video_id)
+            
+            per_frame_hashes, tmk_vector = future_video.result()
+            audio_hashes = future_audio.result()
 
         logger.info(
             f"[{video_id}] Generated {len(per_frame_hashes)} PDQ frames, "
