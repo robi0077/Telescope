@@ -19,9 +19,7 @@ class GOPAlignedDecoder:
         Yields (timestamp, frame_rgb_array) for every I-frame in the GOP structure.
         Uses seek() exactness to snap to I-frames to ensure O(1) decode cost per frame.
         """
-        if not metadata.gop_structure:
-            logger.warning(f"No GOP structure found for {file_path}. Skipping decode.")
-            return
+
 
         with av.open(file_path) as container:
             stream = container.streams.video[0]
