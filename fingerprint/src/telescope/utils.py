@@ -25,20 +25,28 @@ def cleanup_upload_dir():
     
     logger.info("Upload directory cleaned.")
 
-def check_redis_availability() -> bool:
+import time
+import redis
+
+def check_redis_availability(retries: int = 15, delay: int = 2) -> bool:
     """
-    Checks if Redis is available for Async Worker.
+    Checks if Redis is available for Async Worker with retries.
     Returns True if connected, False (and logs warning) if not.
     """
-    if not settings.USE_CELERY:
-        return False
-        
-    try:
-        import redis
-        r = redis.from_url(settings.REDIS_URL, socket_connect_timeout=1)
-        r.ping()
-        logger.info("Redis connected. Async Worker Enabled.")
-        return True
-    except Exception as e:
-        logger.error(f"Redis not available: {e}")
-        return False
+    url = settings.REDIS_URL
+    logger.info(f"Checking Redis availability at {url} (up to {retries * delay}s)...")
+    
+    for i in range(retries):
+        try:
+            r = redis.from_url(url, socket_connect_timeout=2)
+            r.ping()
+            logger.info("Redis connected. Async Worker Enabled.")
+            return True
+        except Exception as e:
+            if i < retries - 1:
+                logger.info(f"Redis not ready yet (attempt {i+1}/{retries}). Waiting {delay}s...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Redis not available after {retries} attempts: {e}")
+                return False
+    return False

@@ -1,4 +1,4 @@
-version: '3.8'
+# 
 
 services:
   # 1. Redis (The Central Nervous System)
@@ -21,6 +21,7 @@ services:
       - UPLOAD_DIR=/app/scrapper_temp
       - OUTPUT_DIR=/app/output_data
       - API_KEY=telescope-secret-key-change-me
+      - USE_CELERY=True
     depends_on:
       - redis
 
