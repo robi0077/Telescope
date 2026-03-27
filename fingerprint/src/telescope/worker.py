@@ -27,6 +27,7 @@ from celery import Celery
 
 from .config   import settings
 from .core     import generator
+from .utils    import add_to_registry, remove_from_registry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,13 +46,17 @@ _TMK_PERIODS = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
 @celery_app.task(bind=True, name="process_video_task")
 def process_video_task(self, file_path: str, video_id: str):
     """
-    Background Celery task.
+    Background Celery task with Persistent Registry protection.
 
-    1. Calls the generation pipeline (parse → decode → PDQF → TMK → audio)
-    2. Writes all output files to OUTPUT_DIR/{video_id}/
-    3. Deletes the temp video file on completion or failure.
+    1. Registers video as IN-FLIGHT in Redis.
+    2. Calls generation pipeline.
+    3. Writes all outputs to disk.
+    4. ONLY IF SUCCESSFUL: Clears registry and deletes source file.
     """
     logger.info(f"[Task {self.request.id}] Starting PDQF+TMK generation for {video_id}")
+    
+    # CRASH PROTECTION: Register as in-flight before starting
+    add_to_registry(video_id)
 
     try:
         metadata, per_frame_hashes, audio_hashes, tmk_vector = \
@@ -65,72 +70,51 @@ def process_video_task(self, file_path: str, video_id: str):
         os.makedirs(video_hash_dir, exist_ok=True)
         os.makedirs(audio_hash_dir, exist_ok=True)
 
-        # ── metadata.json ────────────────────────────────────────────────────
-        _write_json(
-            os.path.join(base_dir, "metadata.json"),
-            {
-                "video_id" : video_id,
-                "duration" : metadata.duration,
-                "width"    : metadata.width,
-                "height"   : metadata.height,
-                "fps"      : metadata.fps,
-                "codec"    : metadata.codec,
-            }
-        )
+        # ── Write Outputs ──
+        _write_json(os.path.join(base_dir, "metadata.json"), {
+            "video_id" : video_id,
+            "duration" : metadata.duration,
+            "width"    : metadata.width,
+            "height"   : metadata.height,
+            "fps"      : metadata.fps,
+            "codec"    : metadata.codec,
+        })
 
-        # ── video_hash/pdq_frames.json  (per-frame PDQ hashes) ───────────────
         if per_frame_hashes:
-            _write_json(
-                os.path.join(video_hash_dir, "pdq_frames.json"),
-                per_frame_hashes
-            )
+            _write_json(os.path.join(video_hash_dir, "pdq_frames.json"), per_frame_hashes)
 
-        # ── video_hash/tmk_vector.json  (temporal signature) ─────────────────
-        _write_json(
-            os.path.join(video_hash_dir, "tmk_vector.json"),
-            {
-                "video_id"  : video_id,
-                "num_frames": len(per_frame_hashes),
-                "periods"   : _TMK_PERIODS,
-                "vector"    : tmk_vector,        # 4096 floats, L2-normalised
-            }
-        )
+        _write_json(os.path.join(video_hash_dir, "tmk_vector.json"), {
+            "video_id"  : video_id,
+            "num_frames": len(per_frame_hashes),
+            "periods"   : _TMK_PERIODS,
+            "vector"    : tmk_vector,
+        })
 
-        # ── audio_hash/fingerprints.json ─────────────────────────────────────
         if audio_hashes:
-            _write_json(
-                os.path.join(audio_hash_dir, "fingerprints.json"),
-                audio_hashes
-            )
+            _write_json(os.path.join(audio_hash_dir, "fingerprints.json"), audio_hashes)
 
-        logger.info(
-            f"[Task {self.request.id}] Done. "
-            f"frames={len(per_frame_hashes)}, "
-            f"audio={len(audio_hashes)}, "
-            f"tmk_dim={len(tmk_vector)}. "
-            f"Output: {base_dir}"
-        )
+        # ── COMMIT: Cleanup ONLY after successful write ──
+        remove_from_registry(video_id)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"Source video {video_id} deleted after successful commit.")
 
         return {
             "status"     : "completed",
             "video_id"   : video_id,
             "pdq_frames" : len(per_frame_hashes),
             "audio_frames": len(audio_hashes),
-            "tmk_dim"    : len(tmk_vector),
             "output"     : base_dir,
         }
 
     except Exception as e:
         logger.error(f"[Task {self.request.id}] Failed for {video_id}: {e}")
+        # NOTE: We DO NOT remove from registry or delete the file on error.
+        # This allows for manual audit of why the video failed.
         raise
 
     finally:
-        # Always clean up the temp file, success or failure
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError as oe:
-                logger.warning(f"Could not remove temp file {file_path}: {oe}")
+        pass # Deletion logic moved to Success-Path
 
 
 # ── Utility ────────────────────────────────────────────────────────────────────

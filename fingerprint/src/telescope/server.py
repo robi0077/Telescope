@@ -17,8 +17,8 @@ logger = logging.getLogger("TelescopeAPI")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    cleanup_upload_dir()
+    # Startup - Skip blind cleanup to protect scraper-populated videos
+    # cleanup_upload_dir() 
     
     # HARD REQUIREMENT: Redis must be available for Celery
     if not check_redis_availability():

@@ -54,3 +54,21 @@ def check_redis_availability(retries: int = 15, delay: int = 2) -> bool:
                 logger.error(f"Redis not available after {retries} attempts: {e}")
                 return False
     return False
+
+def add_to_registry(video_id: str):
+    """Adds a video_id to the persistent 'in-flight' Redis set."""
+    try:
+        r = redis.from_url(settings.REDIS_URL)
+        r.sadd("telescope:in_flight", video_id)
+        logger.info(f"Registered {video_id} as IN-FLIGHT")
+    except Exception as e:
+        logger.error(f"Failed to add {video_id} to registry: {e}")
+
+def remove_from_registry(video_id: str):
+    """Removes a video_id from the persistent 'in-flight' Redis set."""
+    try:
+        r = redis.from_url(settings.REDIS_URL)
+        r.srem("telescope:in_flight", video_id)
+        logger.info(f"Cleared {video_id} from registry")
+    except Exception as e:
+        logger.error(f"Failed to remove {video_id} from registry: {e}")
