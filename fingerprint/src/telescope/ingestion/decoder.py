@@ -32,9 +32,12 @@ class GOPAlignedDecoder:
                 if packet.is_keyframe and packet.pts is not None:
                     try:
                         for frame in packet.decode():
-                            current_ts = float(frame.pts * stream.time_base)
-                            img_array = frame.to_ndarray(format='rgb24')
-                            yield (current_ts, img_array)
+                            # GUARANTEE we only yield the actual pristine keyframe
+                            if frame.key_frame:
+                                current_ts = float(frame.pts * stream.time_base)
+                                img_array = frame.to_ndarray(format='rgb24')
+                                yield (current_ts, img_array)
+                                break  # Prevent duplicate frames from the same packet buffer
                     except Exception as e:
                         logger.error(f"Frame Decode Failed at PTS {packet.pts}: {e}")
                         continue
