@@ -46,7 +46,7 @@ def get_status(api_key: str = Depends(get_api_key)):
     }
 
 @app.post("/fingerprint", response_model=IngestResponse)
-async def fingerprint_video(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
+def fingerprint_video(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
     """
     Accepts a video file, saves it to the temp directory, and dispatches a Celery worker 
     to generate the fingerprints to a JSON file.

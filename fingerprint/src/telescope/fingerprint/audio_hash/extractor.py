@@ -174,7 +174,7 @@ class AcousticExtractor:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=120,
+                timeout=3600,  # 1 hour timeout (handles 4+ hour movies)
             )
 
             if result.returncode != 0:

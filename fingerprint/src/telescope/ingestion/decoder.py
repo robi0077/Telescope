@@ -27,32 +27,14 @@ class GOPAlignedDecoder:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO" 
 
-            for target_ts in metadata.gop_structure:
-                # Seek to the timestamp. 
-                # 'backward' seek guarantees landing on the I-frame preceding or at the timestamp.
-                # Since we are iterating known I-frame timestamps, this should be exact.
-                pts = int(target_ts / stream.time_base)
-                container.seek(pts, stream=stream, any_frame=False, backward=True)
-                
-                # Decode the next frame (which should be the I-frame)
-                try:
-                    for frame in container.decode(stream):
-                        # Validate if this is the I-frame we want (or close enough)
-                        
-                        if frame.key_frame:
-                            # DRIFT CORRECTION
+            # O(N) Sequential Demux — No backward seeking overhead or drift
+            for packet in container.demux(stream):
+                if packet.is_keyframe and packet.pts is not None:
+                    try:
+                        for frame in packet.decode():
                             current_ts = float(frame.pts * stream.time_base)
-                            if abs(current_ts - target_ts) > 0.5:
-                                logger.warning(f"Seek Drift Detected: Target {target_ts:.2f} vs Actual {current_ts:.2f}. Skipping.")
-                                break 
-
-                            # Convert to efficient numpy array (RGB)
                             img_array = frame.to_ndarray(format='rgb24')
                             yield (current_ts, img_array)
-                            break # Only want the single I-frame, stop decoding this GOP
-                        else:
-                            # Should not happen if seek(any_frame=False) works as expected for I-frames
-                            continue
-                except Exception as e:
-                    logger.error(f"Frame Decode Failed at {target_ts}: {e}")
-                    continue
+                    except Exception as e:
+                        logger.error(f"Frame Decode Failed at PTS {packet.pts}: {e}")
+                        continue

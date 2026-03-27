@@ -104,8 +104,11 @@ def pdq_hash(image: np.ndarray) -> tuple[str, np.ndarray]:
 
     # Top-left 16×16 block captures the macro visual structure
     block  = dct2d[:_PDQ_KEEP, :_PDQ_KEEP]        # (16, 16)
-    mean   = float(block.mean())
-    bits   = (block > mean).flatten()              # (256,) bool
+    
+    # Exclude DC coefficient (index 0) from the median threshold to avoid skewing
+    ac_coeffs = block.flatten()[1:]
+    threshold  = float(np.median(ac_coeffs))
+    bits   = (block > threshold).flatten()              # (256,) bool
 
     packed  = np.packbits(bits.astype(np.uint8))
     hex_str = packed.tobytes().hex()               # 64 hex chars
