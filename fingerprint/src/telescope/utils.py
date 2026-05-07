@@ -55,14 +55,20 @@ def check_redis_availability(retries: int = 15, delay: int = 2) -> bool:
                 return False
     return False
 
-def add_to_registry(video_id: str):
-    """Adds a video_id to the persistent 'in-flight' Redis set."""
+def add_to_registry(video_id: str) -> bool:
+    """Returns False if video_id already in-flight."""
     try:
         r = redis.from_url(settings.REDIS_URL)
-        r.sadd("telescope:in_flight", video_id)
+        # SETNX = SET if Not eXists (atomic operation via sadd)
+        added = r.sadd("telescope:in_flight", video_id)
+        if added == 0:
+            logger.warning(f"{video_id} already processing")
+            return False
         logger.info(f"Registered {video_id} as IN-FLIGHT")
+        return True
     except Exception as e:
         logger.error(f"Failed to add {video_id} to registry: {e}")
+        return False
 
 def remove_from_registry(video_id: str):
     """Removes a video_id from the persistent 'in-flight' Redis set."""

@@ -72,8 +72,17 @@ def _downsample_64(filtered: np.ndarray) -> np.ndarray:
         out[:r, :c] = filtered[:r, :c]
         return out
 
-    cropped = filtered[:bh * _PDQ_DIM, :bw * _PDQ_DIM]
-    return cropped.reshape(_PDQ_DIM, bh, _PDQ_DIM, bw).mean(axis=(1, 3))
+    # Avoid intermediate array creation
+    h_crop = bh * _PDQ_DIM
+    w_crop = bw * _PDQ_DIM
+    
+    # Reshape in-place view (no copy)
+    view = filtered[:h_crop, :w_crop].reshape(_PDQ_DIM, bh, _PDQ_DIM, bw)
+    
+    # Use out parameter to avoid temporary
+    result = np.empty((_PDQ_DIM, _PDQ_DIM), dtype=np.float32)
+    np.mean(view, axis=(1, 3), out=result)
+    return result
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

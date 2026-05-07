@@ -24,7 +24,9 @@ Comparison in telescope_db is then a single dot-product (cosine similarity).
 from __future__ import annotations
 
 import logging
+import mmap
 import concurrent.futures
+import multiprocessing as mp
 from typing import Dict, List, Tuple, Any
 
 import numpy as np
@@ -119,46 +121,43 @@ class TMKAccumulator:
 
 # ── Main generator ─────────────────────────────────────────────────────────────
 
+def _process_video_worker(file_path: str, video_id: str, metadata: VideoMetadata) -> Tuple[List[Dict[str, Any]], List[float]]:
+    decoder = GOPAlignedDecoder()
+    bundler = Bundler()
+    per_frame_hashes: List[Dict[str, Any]] = []
+    tmk = TMKAccumulator()
+    for ts, img in decoder.decode_bundlable_frames(file_path, metadata):
+        bundle = bundler.create_bundle(video_id, ts, img)
+        tmk.add_frame(ts, bundle.pdq_bits)
+        per_frame_hashes.append({
+            "video_id" : video_id,
+            "timestamp": ts,
+            "pdq_hash" : bundle.pdq_hash,
+        })
+    return per_frame_hashes, tmk.compute_vector()
+
+def _process_audio_worker(file_path: str, video_id: str) -> List[Dict[str, Any]]:
+    audio_extractor = AcousticExtractor()
+    audio_hashes: List[Dict[str, Any]] = []
+    for ts, hash_val in audio_extractor.extract_audio_hashes(file_path):
+        audio_hashes.append({
+            "video_id"    : video_id,
+            "timestamp"   : ts,
+            "acoustic_hash": hash_val,
+        })
+    return audio_hashes
+
 class FingerprintGenerator:
     """
     The generation Brain of Telescope.
     Orchestrates: Parse → Decode → PDQ Bundle → TMK accumulate → Audio.
-
-    Returns:
-      metadata        : VideoMetadata
-      per_frame_hashes: list of dicts  (one per I-frame, for frame-level use in DB)
-      audio_hashes    : list of dicts  (one per audio window)
-      tmk_vector      : list of 4096 floats (the temporal signature)
     """
 
     def __init__(self) -> None:
-        self.parser          = BitstreamParser()
-        self.decoder         = GOPAlignedDecoder()
-        self.bundler         = Bundler()
-        self.audio_extractor = AcousticExtractor()
-
-    def _run_video_pipeline(self, file_path: str, video_id: str, metadata: VideoMetadata) -> Tuple[List[Dict[str, Any]], List[float]]:
-        per_frame_hashes: List[Dict[str, Any]] = []
-        tmk = TMKAccumulator()
-        for ts, img in self.decoder.decode_bundlable_frames(file_path, metadata):
-            bundle = self.bundler.create_bundle(video_id, ts, img)
-            tmk.add_frame(ts, bundle.pdq_bits)
-            per_frame_hashes.append({
-                "video_id" : video_id,
-                "timestamp": ts,
-                "pdq_hash" : bundle.pdq_hash,
-            })
-        return per_frame_hashes, tmk.compute_vector()
-
-    def _run_audio_pipeline(self, file_path: str, video_id: str) -> List[Dict[str, Any]]:
-        audio_hashes: List[Dict[str, Any]] = []
-        for ts, hash_val in self.audio_extractor.extract_audio_hashes(file_path):
-            audio_hashes.append({
-                "video_id"    : video_id,
-                "timestamp"   : ts,
-                "acoustic_hash": hash_val,
-            })
-        return audio_hashes
+        self.parser = BitstreamParser()
+        self._process_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=mp.cpu_count()
+        )
 
     def extract_fingerprints(
         self,
@@ -166,20 +165,20 @@ class FingerprintGenerator:
         video_id  : str,
     ) -> Tuple[VideoMetadata, List[Dict[str, Any]], List[Dict[str, Any]], List[float]]:
         """
-        Full generation pipeline.
-        Runs Audio and Video extraction concurrently to achieve Single-Pass Disk I/O 
-        via the OS page cache.
+        Full generation pipeline using true multi-processing and memory-mapped I/O.
         """
-        # 1. Parse bitstream (O(1) header read)
-        metadata = self.parser.parse(file_path)
+        # Memory-map the file to share I/O OS page cache between video/audio processes
+        with open(file_path, 'rb') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                # 1. Parse bitstream (O(1) header read)
+                metadata = self.parser.parse(file_path)
 
-        # 2. Run video and audio in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_video = executor.submit(self._run_video_pipeline, file_path, video_id, metadata)
-            future_audio = executor.submit(self._run_audio_pipeline, file_path, video_id)
-            
-            per_frame_hashes, tmk_vector = future_video.result()
-            audio_hashes = future_audio.result()
+                # 2. Run video and audio in parallel processes
+                future_video = self._process_pool.submit(_process_video_worker, file_path, video_id, metadata)
+                future_audio = self._process_pool.submit(_process_audio_worker, file_path, video_id)
+                
+                per_frame_hashes, tmk_vector = future_video.result()
+                audio_hashes = future_audio.result()
 
         logger.info(
             f"[{video_id}] Generated {len(per_frame_hashes)} PDQ frames, "

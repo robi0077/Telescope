@@ -55,6 +55,9 @@ class AcousticExtractor:
         # or analog noise floor, and will NOT generate a hash.
         # This prevents completely different silent videos from matching 100%.
         self.silence_threshold_dbfs = -50.0
+        
+        # Precompute Hanning window to prevent recalculating it for every chunk
+        self._hanning_window = np.hanning(self.window_size).astype(np.float32)
 
     # ─────────────────────────────────────────────────────────────────────
     # Public API
@@ -63,20 +66,25 @@ class AcousticExtractor:
     def extract_audio_hashes(self, file_path: str):
         """
         Yields (timestamp, hex_hash_str) tuples.
-        Tries PyAV first; falls back to ffmpeg subprocess if PyAV fails.
+        Tries PyAV streaming first; falls back to ffmpeg subprocess if PyAV fails.
         """
-        samples = self._decode_via_pyav(file_path)
+        pyav_generator = self._decode_via_pyav(file_path)
+        
+        pyav_success = False
+        for ts, hash_val in self._hash_samples(pyav_generator):
+            pyav_success = True
+            yield (ts, hash_val)
 
-        if samples is None or len(samples) < self.window_size:
-            logger.info(f"PyAV failed or insufficient samples for {file_path}, trying ffmpeg fallback...")
+        if not pyav_success:
+            logger.info(f"PyAV streaming failed or insufficient samples for {file_path}, trying ffmpeg fallback...")
             samples = self._decode_via_ffmpeg(file_path)
 
-        if samples is None or len(samples) < self.window_size:
-            logger.warning(f"No usable audio in {file_path} (tried PyAV + ffmpeg)")
-            return
+            if samples is None or len(samples) < self.window_size:
+                logger.warning(f"No usable audio in {file_path} (tried PyAV + ffmpeg)")
+                return
 
-        logger.info(f"Extracted {len(samples)} PCM samples from {file_path}")
-        yield from self._hash_samples(samples)
+            logger.info(f"Extracted {len(samples)} PCM samples from {file_path} using ffmpeg")
+            yield from self._hash_samples([samples])
 
     # ─────────────────────────────────────────────────────────────────────
     # Decoder 1: PyAV  (fast, zero-copy)
@@ -84,16 +92,14 @@ class AcousticExtractor:
 
     def _decode_via_pyav(self, file_path: str):
         """
-        Decode audio to raw s16 mono 8kHz PCM using PyAV.
-        Returns a flat int16 numpy array, or None on failure.
+        Decode audio to raw s16 mono 8kHz PCM using PyAV in streaming chunks.
+        Yields flat int16 numpy arrays.
         """
         try:
-            pcm_chunks = []
-
             with av.open(file_path) as container:
                 if not container.streams.audio:
                     logger.debug(f"No audio streams in {file_path}")
-                    return None
+                    return
 
                 audio_stream = container.streams.audio[0]
                 codec_name = audio_stream.codec_context.name
@@ -127,25 +133,18 @@ class AcousticExtractor:
                             continue
 
                         for r_frame in resampled_frames:
-                            arr = r_frame.to_ndarray().flatten().astype(np.int16)
-                            pcm_chunks.append(arr)
+                            yield r_frame.to_ndarray().flatten().astype(np.int16)
 
                 # Flush the resampler
                 try:
                     for r_frame in resampler.resample(None):
-                        arr = r_frame.to_ndarray().flatten().astype(np.int16)
-                        pcm_chunks.append(arr)
+                        yield r_frame.to_ndarray().flatten().astype(np.int16)
                 except Exception:
                     pass
 
-            if not pcm_chunks:
-                return None
-
-            return np.concatenate(pcm_chunks)
-
         except Exception as e:
             logger.warning(f"[PyAV] Failed to decode {file_path}: {e}")
-            return None
+            return
 
     # ─────────────────────────────────────────────────────────────────────
     # Decoder 2: ffmpeg subprocess (universal fallback)
@@ -204,44 +203,47 @@ class AcousticExtractor:
     # DSP: sliding window hash generation
     # ─────────────────────────────────────────────────────────────────────
 
-    def _hash_samples(self, samples: np.ndarray):
+    def _hash_samples(self, chunk_generator):
         """
-        Slide a 1-second window over the PCM array with a 0.5-second hop.
+        Slide a 1-second window over the PCM chunks with a 0.5-second hop.
         Ignores silent chunks based on RMS/dBFS energy to prevent false-positive matches.
         Yields (timestamp_seconds, hex_hash_str).
         """
-        total_samples = len(samples)
-        pos = 0
+        buffer = np.array([], dtype=np.int16)
+        absolute_pos = 0
 
-        while pos + self.window_size <= total_samples:
-            chunk = samples[pos:pos + self.window_size]
-            timestamp = pos / self.sample_rate
-
-            # ── Silence Filter (RMS & dBFS) ──
-            # Calculate the Root Mean Square energy of the chunk
-            # Cast to float64 to prevent overflow when squaring int16s
-            rms = np.sqrt(np.mean(chunk.astype(np.float64) ** 2))
-            
-            # Convert RMS to Decibels relative to Full Scale (16-bit PCM max = 32768)
-            dbfs = 20 * np.log10(rms / 32768.0) if rms > 0 else -float('inf')
-
-            # If the chunk is quieter than our threshold, it's silence/noise floor. Skip it.
-            if dbfs < self.silence_threshold_dbfs:
-                pos += self.hop_size
+        for chunk in chunk_generator:
+            if len(chunk) == 0:
                 continue
+            buffer = np.concatenate([buffer, chunk])
 
-            try:
-                hash_val = self._compute_dct_hash(chunk)
-                yield (timestamp, hash_val)
-            except Exception as e:
-                logger.debug(f"DSP error at {timestamp:.2f}s: {e}")
+            while len(buffer) >= self.window_size:
+                window = buffer[:self.window_size]
+                timestamp = absolute_pos / self.sample_rate
 
-            pos += self.hop_size
+                # ── Silence Filter (RMS & dBFS) ──
+                # Calculate the Root Mean Square energy of the window
+                # Cast to float64 to prevent overflow when squaring int16s
+                rms = np.sqrt(np.mean(window.astype(np.float64) ** 2))
+                
+                # Convert RMS to Decibels relative to Full Scale (16-bit PCM max = 32768)
+                dbfs = 20 * np.log10(rms / 32768.0) if rms > 0 else -float('inf')
+
+                # If the window is quieter than our threshold, it's silence/noise floor. Skip it.
+                if dbfs >= self.silence_threshold_dbfs:
+                    try:
+                        hash_val = self._compute_dct_hash(window)
+                        yield (timestamp, hash_val)
+                    except Exception as e:
+                        logger.debug(f"DSP error at {timestamp:.2f}s: {e}")
+
+                buffer = buffer[self.hop_size:]
+                absolute_pos += self.hop_size
 
     def _compute_dct_hash(self, chunk: np.ndarray) -> str:
         """Transforms 8000 PCM samples into a 64-bit hex hash string."""
         # 1. Hanning window (prevents edge spectral leakage)
-        windowed = chunk.astype(np.float32) * np.hanning(self.window_size)
+        windowed = chunk.astype(np.float32) * self._hanning_window
 
         # 2. STFT — 129 frequency bands × ~62 time frames
         _, _, Zxx = scipy.signal.stft(windowed, fs=self.sample_rate, nperseg=256)
