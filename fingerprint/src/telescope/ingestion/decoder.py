@@ -24,10 +24,13 @@ class GOPAlignedDecoder:
         with av.open(file_path) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO" 
+            
+            # Hardware-level instruction: Drop P/B frames at C-level, maintain O(1) decode cost
+            stream.codec_context.skip_frame = "NONKEY"
 
-            # O(N) Sequential Demux — No backward seeking overhead or drift
+            # O(N) Sequential Demux — Feed EVERY packet to prevent engine starvation
             for packet in container.demux(stream):
-                if packet.is_keyframe and packet.pts is not None:
+                if packet.pts is not None:
                     try:
                         for frame in packet.decode():
                             # GUARANTEE we only yield the actual pristine keyframe
